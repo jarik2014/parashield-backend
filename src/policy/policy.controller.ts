@@ -18,6 +18,8 @@ import {
   UseInterceptors,
   Req,
   UnauthorizedException,
+  ParseUUIDPipe,
+  Logger,
 } from '@nestjs/common';
 import { StreamingInterceptor } from '../common/interceptors/streaming.interceptor';
 import { Observable } from 'rxjs';
@@ -58,6 +60,8 @@ const SSE_TCP_KEEPALIVE_MS = 30_000;
 @ApiExtraModels(ResponseDto, PaginatedResponseDto, ProductResponseDto, PolicyResponseDto, CancellationResponseDto)
 @ApiExtraModels(ResponseDto, PaginatedResponseDto, ProductResponseDto, PolicyResponseDto, PolicyStatusEventDto)
 export class PolicyController {
+  private readonly logger = new Logger(PolicyController.name);
+
   constructor(
     private readonly policy: PolicyService,
     private readonly statusEvents: StatusEventsService,
@@ -449,7 +453,7 @@ export class PolicyController {
   @ApiErrorResponse(403, 'Policy belongs to a different wallet.', undefined, 'Policy belongs to a different wallet')
   @ApiErrorResponse(404, 'No policy found for the given ID.', undefined, 'Policy not found')
   async policyStatusEvents(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @Req() req: AuthenticatedRequest,
   ): Promise<Observable<MessageEvent>> {
     const policyData = await this.policy.getPolicy(id);
@@ -461,15 +465,49 @@ export class PolicyController {
       throw new ForbiddenException('Policy belongs to a different wallet');
     }
 
+    // #708 — an EventSource reconnect lands here again, but nothing re-checked the
+    // credential, so an expired token kept receiving updates. Fail the handshake.
+    const tokenExpiresAt = typeof req.user?.exp === 'number' ? req.user.exp * 1000 : null;
+    if (tokenExpiresAt !== null && Date.now() >= tokenExpiresAt) {
+      this.logger.warn(`Rejected policy status SSE reconnect for ${id}: access token expired`);
+      throw new UnauthorizedException('Access token expired');
+    }
+
     return new Observable<MessageEvent>((subscriber) => {
+      // #708 — the stream can outlive the credential that opened it. Close it as
+      // soon as the token expires, and re-check ownership periodically, because a
+      // policy can move or be revoked while the client is still listening.
+      const closeForAuth = (reason: string): void => {
+        if (subscriber.closed) return;
+        subscriber.error(new UnauthorizedException(reason));
+      };
+
+      const revalidateOwnership = async (): Promise<void> => {
+        try {
+          const fresh = await this.policy.getPolicy(id);
+          if (!fresh || fresh.policyholder !== authedWallet) {
+            this.logger.warn(`Closing policy status SSE stream for ${id}: policy no longer belongs to this wallet`);
+            closeForAuth('Policy is no longer available to this wallet');
+          }
+        } catch {
+          // Transient lookup failure must not drop a live stream; the next tick retries.
+        }
+      };
+
+      let revalidationTicks = 0;
+     
       // Emit the current status immediately so a client doesn't have to wait
       // for the next transition just to know where things stand.
       subscriber.next({ data: { policyId: id, status: policyData.status, timestamp: Date.now() } });
 
       const unsubscribe = this.statusEvents.subscribeToPolicyStatus(id, (event) => {
-        if (!subscriber.closed) {
-          subscriber.next({ data: event });
+        if (subscriber.closed) return;
+        if (tokenExpiresAt !== null && Date.now() >= tokenExpiresAt) {
+          this.logger.warn(`Closing policy status SSE stream for ${id}: access token expired`);
+          closeForAuth('Access token expired');
+          return;
         }
+        subscriber.next({ data: event });
       }, authedWallet);
 
       // #491 — detect clients that went away without a clean close. The
@@ -477,8 +515,22 @@ export class PolicyController {
       // normal disconnect fire 'close' on the request, which completes the
       // stream and runs the teardown below.
       const heartbeat = setInterval(() => {
-        if (!subscriber.closed) {
-          subscriber.next({ type: 'heartbeat', data: { timestamp: Date.now() } });
+        if (subscriber.closed) return;
+
+        // #708 — the credential, not the socket, decides how long the stream lives.
+        if (tokenExpiresAt !== null && Date.now() >= tokenExpiresAt) {
+          this.logger.warn(`Closing policy status SSE stream for ${id}: access token expired`);
+          closeForAuth('Access token expired');
+          return;
+        }
+
+        subscriber.next({ type: 'heartbeat', data: { timestamp: Date.now() } });
+
+        // Ownership is re-checked once a minute rather than every tick: cheap
+        // enough to catch a revoked policy, rare enough not to hammer the store.
+        revalidationTicks += 1;
+        if (revalidationTicks % 4 === 0) {
+          void revalidateOwnership();
         }
       }, SSE_HEARTBEAT_INTERVAL_MS);
       heartbeat.unref?.();

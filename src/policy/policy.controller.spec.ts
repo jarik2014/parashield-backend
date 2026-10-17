@@ -1,4 +1,5 @@
 import { Test, TestingModule } from "@nestjs/testing";
+import { Logger, UnauthorizedException } from "@nestjs/common";
 import { PolicyController, SSE_HEARTBEAT_INTERVAL_MS } from "./policy.controller";
 import { EventEmitter } from "events";
 import { PolicyService } from "./policy.service";
@@ -698,6 +699,39 @@ describe("PolicyController", () => {
       sub.unsubscribe();
     });
 
+    // #708 — an EventSource reconnect with an expired token used to keep streaming.
+    it("rejects a reconnect whose token has already expired", async () => {
+      const req = sseRequest();
+      (req as any).user = { walletAddress: wallet, exp: Math.floor(Date.now() / 1000) - 1 };
+
+      await expect(controller.policyStatusEvents("p1", req)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it("closes the open stream when the token expires mid-stream", async () => {
+      const req = sseRequest();
+      (req as any).user = { walletAddress: wallet, exp: Math.floor(Date.now() / 1000) + 20 };
+      const errors: unknown[] = [];
+
+      const stream = await controller.policyStatusEvents("p1", req);
+      const sub = stream.subscribe({ next: () => {}, error: (e) => errors.push(e) });
+
+      jest.advanceTimersByTime(SSE_HEARTBEAT_INTERVAL_MS * 3);
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(UnauthorizedException);
+      expect(sub.closed).toBe(true);
+    });
+
+    it("logs an unauthorized reconnect instead of failing silently", async () => {
+      const warn = jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      const req = sseRequest();
+      (req as any).user = { walletAddress: wallet, exp: Math.floor(Date.now() / 1000) - 1 };
+
+      await expect(controller.policyStatusEvents("p1", req)).rejects.toThrow(UnauthorizedException);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("access token expired"));
+      warn.mockRestore();
+    });
+
     it("tears down the status subscription and heartbeat when the client disconnects", async () => {
       const req = sseRequest();
       const events: any[] = [];
@@ -714,6 +748,16 @@ describe("PolicyController", () => {
       const countAfterClose = events.length;
       jest.advanceTimersByTime(SSE_HEARTBEAT_INTERVAL_MS * 3);
       expect(events).toHaveLength(countAfterClose);
+    });
+    it('should throw BadRequestException when policy ID is not a valid UUID', async () => {
+      const req = sseRequest();
+      await expect(controller.policyStatusEvents('invalid-uuid', req)).rejects.toThrow(BadRequestException);
+    });
+
+    it('should throw NotFoundException when policy does not exist', async () => {
+      const req = sseRequest();
+      mockPolicyService.getPolicy.mockResolvedValueOnce(null);
+      await expect(controller.policyStatusEvents('123e4567-e89b-12d3-a456-426614174000', req)).rejects.toThrow(NotFoundException);
     });
   });
 });
